@@ -23,6 +23,10 @@
  *  StorageEntry – shape of a stored record
  */
 
+import { CID } from "multiformats/cid";
+import * as raw from "multiformats/codecs/raw";
+import { sha256 } from "multiformats/hashes/sha2";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -71,7 +75,10 @@ class MemoryAdapter implements IpfsStorageAdapter {
     entry: Omit<StorageEntry, "hash">,
     suggestedHash?: string
   ): Promise<string> {
-    const hash = suggestedHash ?? generateHash();
+    // #1188 – derive a real content identifier from the payload bytes.
+    const hash = suggestedHash
+      ? validateCid(suggestedHash)
+      : await computeCid(entry.data);
     this.store.set(hash, { ...entry, hash });
     return hash;
   }
@@ -156,13 +163,52 @@ function resolveGatewayBase(): string {
   return FALLBACK_GATEWAY;
 }
 
-function generateHash(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz234567";
-  let hash = "Qm";
-  for (let i = 0; i < 44; i++) {
-    hash += chars[Math.floor(Math.random() * chars.length)];
+/**
+ * #1188 – Deterministic serialisation of a payload so that the same logical
+ * content always yields the same bytes (and therefore the same CID).
+ * Object keys are sorted recursively; `undefined` values are dropped.
+ */
+function canonicalize(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null";
   }
-  return hash;
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalize(v)).join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${canonicalize(obj[k])}`)
+    .join(",")}}`;
+}
+
+/**
+ * #1188 – Compute a real CIDv1 (raw codec, sha2-256 multihash) from the
+ * payload bytes.  This replaces the previous random `Qm…` pseudo-hash.
+ */
+async function computeCid(data: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(canonicalize(data));
+  const digest = await sha256.digest(bytes);
+  const cid = CID.createV1(raw.code, digest);
+  return cid.toString();
+}
+
+/**
+ * #1188 – Parse and validate a CID string with the standard multiformats
+ * parser.  Throws a descriptive error when the value is not a valid CID so
+ * that invalid identifiers never reach a gateway URL.
+ */
+function validateCid(hash: string): string {
+  if (typeof hash !== "string" || hash.length === 0) {
+    throw new Error("IPFS CID is required");
+  }
+  try {
+    return CID.parse(hash).toString();
+  } catch {
+    throw new Error(`Invalid IPFS CID: "${hash}"`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +257,8 @@ export async function uploadFile(
  * Throws if the hash is not found in the adapter.
  */
 export async function retrieve(hash: string): Promise<unknown> {
-  const entry = await adapter.get(hash);
+  const cid = validateCid(hash);
+  const entry = await adapter.get(cid);
   if (!entry) {
     throw new Error(`Failed to retrieve data from IPFS: hash ${hash} not found`);
   }
@@ -243,27 +290,28 @@ export async function retrieve(hash: string): Promise<unknown> {
  * Returns `false` and records the error when the adapter reports failure.
  */
 export async function pinHash(hash: string, name?: string): Promise<boolean> {
-  const exists = await adapter.has(hash);
+  const cid = validateCid(hash);
+  const exists = await adapter.has(cid);
   if (!exists) {
     throw new Error(`Hash ${hash} not found`);
   }
 
   // Step 1 – record intent
-  await adapter.updatePinStatus(hash, "requested");
+  await adapter.updatePinStatus(cid, "requested");
 
   try {
     // Step 2 – simulate/perform provider confirmation
     // In the mock adapter the "provider" is immediate; a real adapter would
     // make an HTTP request here and wait for the provider's confirmation.
-    await simulateProviderPin(hash, name);
+    await simulateProviderPin(cid, name);
 
     // Step 3a – confirmed
-    await adapter.updatePinStatus(hash, "pinned");
+    await adapter.updatePinStatus(cid, "pinned");
     return true;
   } catch (err) {
     // Step 3b – failed; store reason for retry
     const message = err instanceof Error ? err.message : "unknown provider error";
-    await adapter.updatePinStatus(hash, "failed", {
+    await adapter.updatePinStatus(cid, "failed", {
       error: message,
       incrementRetry: true,
     });
@@ -287,7 +335,9 @@ export function getGatewayUrl(hash: string): string {
   if (!hash || typeof hash !== "string") {
     throw new Error("IPFS hash is required to build a gateway URL");
   }
-  return `${resolveGatewayBase()}${hash}`;
+  // #1188 – never build a URL from an unvalidated identifier.
+  const cid = validateCid(hash);
+  return `${resolveGatewayBase()}${cid}`;
 }
 
 /**
@@ -305,13 +355,14 @@ export async function getStorageStatus(hash: string): Promise<{
   pinRetries?: number;
   pinError?: string;
 }> {
-  const entry = await adapter.get(hash);
+  const cid = validateCid(hash);
+  const entry = await adapter.get(cid);
   const pinStatus: PinStatus = entry?.pinStatus ?? "none";
   return {
     stored: entry !== undefined,
     pinStatus,
     pinned: pinStatus === "pinned",
-    gatewayUrl: getGatewayUrl(hash),
+    gatewayUrl: getGatewayUrl(cid),
     ...(entry?.pinRetries !== undefined ? { pinRetries: entry.pinRetries } : {}),
     ...(entry?.pinError ? { pinError: entry.pinError } : {}),
   };
@@ -319,5 +370,32 @@ export async function getStorageStatus(hash: string): Promise<{
 
 /** Exposed for testing — returns the raw adapter entry. */
 export async function getEntry(hash: string): Promise<StorageEntry | undefined> {
-  return adapter.get(hash);
+  return adapter.get(validateCid(hash));
+}
+
+/**
+ * #1188 – Compute the CID for a payload without storing it.  Useful for
+ * callers that need to verify content addressing independently.
+ */
+export async function computeContentCid(data: unknown): Promise<string> {
+  return computeCid(data);
+}
+
+/**
+ * #1188 – Verify that the bytes fetched from the configured gateway match the
+ * locally stored payload for `hash`.  Returns `true` when the gateway content
+ * hashes to the same CID.
+ */
+export async function verifyGatewayContent(hash: string): Promise<boolean> {
+  const cid = validateCid(hash);
+  const entry = await adapter.get(cid);
+  if (!entry) return false;
+  const expected = await computeCid(entry.data);
+  if (expected !== cid) return false;
+  const response = await fetch(getGatewayUrl(cid));
+  if (!response.ok) return false;
+  const remoteBytes = new Uint8Array(await response.arrayBuffer());
+  const remoteDigest = await sha256.digest(remoteBytes);
+  const remoteCid = CID.createV1(raw.code, remoteDigest).toString();
+  return remoteCid === cid;
 }
